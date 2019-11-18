@@ -2,12 +2,20 @@ open Printf
 
 let md5 source = Digest.(to_hex (string source))
 
-let ok = Stdlib.Result.ok
+let (>>=) = Stdlib.Result.bind
 
 let or_fail = Caqti_blocking.or_fail
 
+let read_dir (dir: string): (string array, _) result =
+  try Ok (Sys.readdir dir) with Sys_error e -> Error (`Dir e)
+
+let read_file (name: string): (string, _) result =
+  try Ok Stdio.In_channel.(with_file name ~f:input_all) with
+  Sys_error e -> eprintf "%s\n" e; Error (`File e)
+
 module Migration = struct
   type 'source t = {source: 'source; name: string; hash: string}
+
 
   module On_disc = struct
     type nonrec t = string t
@@ -23,19 +31,27 @@ module Migration = struct
       List.map (fun (name, hash) -> {source=(); name; hash})
   end
 
-  let same on_disc in_db =
-    on_disc.name = in_db.name && on_disc.hash = in_db.hash
+  module Plan = struct
+    type t = {initialize: bool; apply: On_disc.t list}
+  end
 
-  let rec compare_many on_disc in_db =
+  let verify on_disc in_db =
+    if on_disc.name <> in_db.name then
+      Error (`Name_mismatch (on_disc.name, in_db.name))
+    else if on_disc.hash <> on_disc.hash then
+      Error (`Hash_mismatch (on_disc.hash, in_db.hash))
+    else
+      Ok ()
+
+  let rec pending on_disc in_db =
     match on_disc, in_db with
-    | x :: xs, y :: ys ->
-        if same x y then compare_many xs ys else Error `Conflicting_migrations
-    | [], _ :: _ -> Error `Db_is_ahead_of_sources
-    | migrations, [] -> Ok (`Apply migrations)
+    | x :: xs, y :: ys -> verify x y >>= fun () -> pending xs ys
+    | [], in_db -> Error (`Db_is_ahead_of_sources (List.map (fun x -> x.name) in_db))
+    | on_disc, [] -> Ok on_disc
 end
 
 module SQL = struct
-  let query multiplicity input output source =
+  let query multiplicity output input source =
     Caqti_request.create_p input output multiplicity (fun _ -> source)
 
   let zero, one, zero_or_one, zero_or_more =
@@ -47,7 +63,7 @@ end
 
 module Migrations = struct
   let table_exists =
-    SQL.(query one unit bool)
+    SQL.(query one bool unit)
     "select to_regclass('migrations') is not null"
 
   let create =
@@ -60,27 +76,52 @@ module Migrations = struct
     |}
 
   let all =
-    SQL.(query zero_or_more unit (tup2 string string))
+    SQL.(query zero_or_more (tup2 string string) unit)
     "select name, hash from migrations order by id"
 
   let insert =
-    SQL.(query zero (tup2 string string) unit)
+    SQL.(query zero unit (tup2 string string))
     "insert into migrations (name, hash) values ($1, $2)"
 end
 
 
 let plus =
-  SQL.(query one (tup2 int int) int)
+  SQL.(query one int (tup2 int int))
   "select ?::integer + ?::integer"
+
+let (let*) = Stdlib.Result.bind
+
+let read_source_migrations dir =
+  let* names = read_dir dir in
+  Base.Array.sort ~compare:Base.String.compare names;
+  let names = Base.Array.to_list names in
+  Base.List.fold_result names ~init:[] ~f:(fun tail name ->
+    let* source = read_file (dir ^ "/" ^ name) in
+    Ok (Migration.{source; name; hash=md5 source} :: tail))
+
+let read_db_migrations (module C: Caqti_blocking.CONNECTION) =
+  let* exists = C.find Migrations.table_exists () in
+  if not exists then Ok None else
+  let* migrations = C.fold Migrations.all (fun (name, hash) tail ->
+    Migration.{name; hash; source=()} :: tail) () [] in
+  Ok (Some (List.rev migrations))
+
 
 let main argv =
   match argv with
-  | [program] -> eprintf "Usage: %s <uri>" program
-  | [_; uri] ->
+  | [_; uri; dir] ->
       let uri = Uri.of_string uri in
-      let module C = (val Caqti_blocking.(connect uri |> or_fail)) in
-      printf "%s %d\n" Sys.ocaml_version (C.find plus (7, 13) |> or_fail);
-      printf "=> %b\n" (C.find Migrations.table_exists () |> or_fail)
+      let connection = Caqti_blocking.(connect uri |> or_fail) in
+      let in_db = read_db_migrations connection |> or_fail |> Option.get in
+      printf "db:\n";
+      Base.List.iter in_db ~f:(fun {name; hash; _} -> printf "%s: %s\n" name hash);
+      printf "disc:\n";
+      let on_disc = read_source_migrations dir |> Stdlib.Result.get_ok in
+      Base.List.iter on_disc ~f:(fun {name; hash; _} -> printf "%s: %s\n" name hash);
+      printf "ok\n"
+(*       printf "%s %d\n" Sys.ocaml_version (C.find plus (7, 13) |> or_fail); *)
+(*       printf "=> %b\n" (C.find Migrations.table_exists () |> or_fail) *)
+  | program :: _ -> eprintf "Usage: %s <uri> <dir>" program
   | _ -> assert false
 
 let () = main (Array.to_list Sys.argv)
