@@ -1,0 +1,3 @@
+(executable
+ (name migrate)
+ (libraries caqti caqti.blocking caqti-driver-postgresql))
